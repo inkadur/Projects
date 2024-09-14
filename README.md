@@ -1,0 +1,1 @@
+This repository contains a collection of projects I have worked on, primarily focusing on software engineering, data engineering, and backend development. Each branch features a unique project that showcases my technical skills and experience across various technologies and programming languages.
