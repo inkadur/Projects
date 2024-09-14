@@ -1,0 +1,17 @@
+# Data Structures and Algorithms
+
+## Overview
+This repository contains implementations of common data structures and algorithms in Java. The goal is to demonstrate proficiency in algorithmic problem-solving and low-level implementation of various data structures.
+
+## Contents
+- Sorting Algorithms: Quick Sort, Merge Sort, etc.
+- Search Algorithms: Binary Search, Breadth-First Search, Depth-First Search
+- Data Structures: Linked Lists, Trees, Graphs, Heaps, HashMaps
+
+## Future Work
+- Optimization of algorithms for time and space complexity.
+- Addition of more advanced data structures such as Suffix Trees and Red-Black Trees.
+
+## Technologies
+- Java
+- Unit tests for validation of algorithms.
