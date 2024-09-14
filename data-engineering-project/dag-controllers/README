@@ -1,0 +1,9 @@
+Controllers: Airflow DAGs
+
+Overview
+This directory contains Airflow Directed Acyclic Graphs (DAGs) that automate the data ingestion, transformation, and loading processes. After validating logic in Jupyter Notebooks, we built DAGs to handle regular updates, data merging, and CDC.
+
+Features
+- Automated ETL processes.
+- CDC logic for handling data updates (e.g., adding `date_created`, `date_deleted` fields).
+- Workflow management for daily or event-based data updates.
