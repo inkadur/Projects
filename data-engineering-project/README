@@ -1,0 +1,29 @@
+# Data Engineering Project: Recipe Integration and Social Media Simulation
+
+## Overview
+This project integrates data from multiple sources into a unified database hosted on Google Cloud Platform (GCP). The project simulates a social media site for sharing recipes, featuring users, posts, and comments. Data was transformed, merged, and enriched using AI for creative user profiles and content.
+
+## Goals
+- Integrate data from two distinct recipe sources.
+- Normalize data through field/entity decomposition and merging.
+- Simulate a social media platform with users, posts, and comments.
+
+## Data Pipeline Structure
+1. **Raw Layer:** Stores unprocessed data.
+2. **Staging Layer:** Ensures integrity with primary/foreign key checks.
+3. **Consumption Layer:** Supports CDC (Change Data Capture) without strict key enforcement for updates.
+
+## AI Usage
+- Used Gemmini AI for generating creative usernames and comments.
+- Data enrichment for incomplete fields.
+
+## Technologies
+- Airflow
+- GCP 
+- SQL
+- Python
+
+## Structure
+- `jupyter_notebooks`: Prototyping and data transformation logic.
+- `day_controllers`: Airflow DAGs for automating data ingestion and processing.
+- `entity_relation_diagrams`: Database schema and entity relations.
