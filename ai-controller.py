@@ -2,6 +2,8 @@ import airflow
 from airflow import DAG
 from airflow.operators.dummy import DummyOperator
 from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateEmptyDatasetOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryDeleteTableOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.time_delta import TimeDeltaSensor
 from airflow.utils.dates import days_ago
@@ -14,9 +16,9 @@ default_args = {
 }
 
 dag = DAG(
-    dag_id='ai-comments-controller',
+    dag_id='ai-controller',
     default_args=default_args,
-    description='controller dag to create ai generated comments',
+    description='ai controller dag',
     schedule_interval=None,
     max_active_runs=1,
     concurrency=1,
@@ -40,36 +42,143 @@ region = 'us-central1'
 create_dataset_stg_af_ai = BigQueryCreateEmptyDatasetOperator(
     task_id='create_dataset_stg_af_ai',
     project_id=project_id,
-    dataset_id=stg_dataset_name,
+    dataset_id=ai_stg_dataset_name,
     location=region,
     if_exists='ignore',
     dag=dag)
 
 
 
-# create recipes_directions 
+# create recipes_directions
 
-ai_comments_sql = (f"""
-declare prompt_query STRING default "You are a user of a recipe sharing social media, write 3 original, creative, and relevant comments for the recipe in 25 or fewer words (you are a different user for each comment, so exhibit a different level of satisfaction). Return output as a CLOSED, COMPLETE json with only recipe_id, comment1, comment2, comment3";
-create or replace table {ai_stg_dataset_name}.ai_comments as
+recipes_directions_sql = (f"""
+declare prompt_query STRING default " Create directions based on the ingredients and title of the recipe. All in one line, no numbering of steps. Return output as json with recipe_id, title, ingredients, and directions. Give best attempt at creating directions, no null directions.";
+create or replace table {ai_stg_dataset_name}.recipes_directions as
 select *
 from ML.generate_text(
-  model remote_models.gemini_pro,
+  model remote_model_central.gemini_pro,
   (
-    select concat(prompt_query, to_json_string(json_object("recipe_id", recipe_id, "title", title, "directions", directions, "note", note, 'ease_of_prep', ease_of_prep))) as prompt
-    from {stg_dataset_name}.Recipes as r
-    order by r.recipe_id
+    SELECT concat(prompt_query, to_json_string(json_object("recipe_id", recipe_id, "title", title, "ingredients", all_ingredients))) as prompt
+     FROM (
+     SELECT
+      r.recipe_id,
+      r.title,
+      STRING_AGG(i.name, ', ') AS all_ingredients
+    FROM
+      {stg_dataset_name}.Recipes AS r
+    LEFT JOIN {stg_dataset_name}.Quantity AS q
+    ON q.recipe_id = r.recipe_id
+    LEFT JOIN {stg_dataset_name}.Ingredients AS i
+    ON i.ingredient_id = q.ingredient_id
+    WHERE r.directions IS NULL
+    AND r.title NOT LIKE '-%-'
+    GROUP BY
+      r.recipe_id, r.title)
+  ),
+  struct(TRUE as flatten_json_output)
+)
+"""
+)
+
+create_recipes_directions_csp = BigQueryInsertJobOperator(
+    task_id="create_recipes_directions_csp",
+    configuration={
+        "query": {
+            "query": recipes_directions_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# change json format for recipes_directions
+recipes_directions_json_format_sql = (f"""
+create or replace table  {ai_stg_dataset_name}.recipes_directions_json_format as
+select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\\\\n', ''), ']', ''), '[' , '')) as ml_generate_text_llm_result
+from {ai_stg_dataset_name}.recipes_directions;
+""")
+
+create_recipes_directions_json_format_csp = BigQueryInsertJobOperator(
+    task_id="create_recipes_directions_json_format_csp",
+    configuration={
+        "query": {
+            "query": recipes_directions_json_format_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# close the json for recipes_directions_format_sql 
+recipes_directions_closed_sql =(""" 
+UPDATE  magazine_recipes_stg_af_ai.recipes_directions_json_format 
+set ml_generate_text_llm_result = concat(ml_generate_text_llm_result, '"}')
+where ml_generate_text_llm_result not like '%"}%';
+""")
+
+create_recipes_directions_closed_csp = BigQueryInsertJobOperator(
+    task_id="create_recipes_directions_closed_csp",
+    configuration={
+        "query": {
+            "query": recipes_directions_closed_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# create directions 
+
+directions_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.directions AS
+select json_value(ml_generate_text_llm_result, '$.recipe_id') as recipe_id,
+  json_value(ml_generate_text_llm_result, '$.title') as title,
+  json_value(ml_generate_text_llm_result, '$.directions') as recipe_directions,
+  json_value(ml_generate_text_llm_result, '$.ingredients') as database_ingredients
+from {ai_stg_dataset_name}.recipes_directions_json_format
+"""
+)
+
+create_directions_csp = BigQueryInsertJobOperator(
+    task_id="create_directions_csp",
+    configuration={
+        "query": {
+            "query": directions_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# create recipes_directions_for_nulls 
+
+recipes_directions_for_nulls_sql = (f"""
+declare prompt_query STRING default " You must write directions for the following recipe WITH LESS THAN 30 WORDS. All in one line, no numbering of steps. Return output with recipe_id, title, and directions as a VALID CLOSED JSON. ";
+create or replace table {ai_stg_dataset_name}.recipes_directions_for_nulls as
+select *
+from ML.generate_text(
+  model remote_model_central.gemini_pro,
+  (
+    SELECT concat(prompt_query, to_json_string(json_object("recipe_id", recipe_id, "title", title))) as prompt
+     FROM (
+     SELECT
+      recipe_id,
+      title,
+    FROM
+    {ai_stg_dataset_name}.directions
+    WHERE recipe_directions IS NULL)
   ),
   struct(TRUE as flatten_json_output)
 );
 """
 )
 
-create_ai_comments_csp = BigQueryInsertJobOperator(
-    task_id="create_ai_comments_csp",
+create_recipes_directions_for_nulls_csp = BigQueryInsertJobOperator(
+    task_id="create_recipes_directions_for_nulls_csp",
     configuration={
         "query": {
-            "query": ai_comments_sql,
+            "query": recipes_directions_for_nulls_sql,
             "useLegacySql": False,
         }
     },
@@ -77,138 +186,194 @@ create_ai_comments_csp = BigQueryInsertJobOperator(
     dag=dag)
 
 
-# format comments 
+# change json format for recipes_directions_for_nulls
 
-format_comments_sql = (f"""
-create or replace table  {ai_stg_dataset_name}.comments_formatted as
-  select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\n', ''), ']', ''), '[' , '')) as formatted_comment
-  from {ai_stg_dataset_name}.ai_comments
+recipes_directions_for_nulls_json_format_sql = (f"""
+create or replace table  {ai_stg_dataset_name}.recipes_directions_for_nulls_json_format as
+select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\\\\n', ''), ']', ''), '[' , '')) as ml_generate_text_llm_result
+from {ai_stg_dataset_name}.recipes_directions_for_nulls
+""")
+
+create_recipes_directions_for_nulls_json_format_csp = BigQueryInsertJobOperator(
+    task_id="create_recipes_directions_for_nulls_json_format_csp",
+    configuration={
+        "query": {
+            "query": recipes_directions_for_nulls_json_format_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# close the json for recipes_directions_for_nulls_format_sql 
+recipes_directions_for_nulls_closed_sql =(""" 
+UPDATE  magazine_recipes_stg_af_ai.recipes_directions_for_nulls_json_format 
+set ml_generate_text_llm_result = concat(ml_generate_text_llm_result, '"}')
+where ml_generate_text_llm_result not like '%"}%'
+""")
+
+create_recipes_directions_for_nulls_closed_csp = BigQueryInsertJobOperator(
+    task_id="create_recipes_directions_for_nulls_closed_csp",
+    configuration={
+        "query": {
+            "query": recipes_directions_for_nulls_closed_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# create directions_for_nulls
+
+directions_for_nulls_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.directions_for_nulls AS
+select json_value(ml_generate_text_llm_result, '$.recipe_id') as recipe_id,
+  json_value(ml_generate_text_llm_result, '$.title') as title,
+  json_value(ml_generate_text_llm_result, '$.directions') as recipe_directions
+from {ai_stg_dataset_name}.recipes_directions_for_nulls_json_format
 """
 )
 
-format_ai_comments_csp = BigQueryInsertJobOperator(
-    task_id="format_ai_comments_csp",
+create_directions_for_nulls_csp = BigQueryInsertJobOperator(
+    task_id="create_directions_for_nulls_csp",
     configuration={
         "query": {
-            "query": format_comments_sql,
+            "query": directions_for_nulls_sql,
             "useLegacySql": False,
         }
     },
     location=region,
     dag=dag)
 
-# close json for incomplete outputs
+# Update directions with 9 nulls 
 
-close_comments_sql = (f"""
-update  {ai_stg_dataset_name}.comments_formatted 
-set formatted_comment = concat(formatted_comment, '"}')
-where formatted_comment not like '%"}%
-""")
-
-close_comments_csp = BigQueryInsertJobOperator(
-    task_id="close_comments_csp",
-    configuration={
-        "query": {
-            "query": close_comments_sql,
-            "useLegacySql": False,
-        }
-    },
-    location=region,
-    dag=dag)
-
-# create wide comments table from ai output 
-
-recipe_comments_sql = (f"""
-%%bigquery
-CREATE OR REPLACE TABLE {ai_stg_dataset_name}.recipe_comments AS
-select
-cast(json_value(formatted_comment, '$.recipe_id') as int64) as recipe_id,
-json_value(formatted_comment, '$.title') as title,
-json_value(formatted_comment, '$.comment1') as comment1,
-json_value(formatted_comment, '$.comment2') as comment2,
-json_value(formatted_comment, '$.comment3') as comment3
-from {ai_stg_dataset_name}.comments_formatted 
+update_directions_sql = (f"""
+UPDATE {ai_stg_dataset_name}.directions d
+SET d.recipe_directions = dn.recipe_directions
+FROM {ai_stg_dataset_name}.directions_for_nulls AS dn
+WHERE d.recipe_id = dn.recipe_id
 """
 )
 
-create_recipe_comments_csp = BigQueryInsertJobOperator(
-    task_id="create_recipe_comments_csp",
+update_directions_csp = BigQueryInsertJobOperator(
+    task_id="update_directions_csp",
     configuration={
         "query": {
-            "query": recipe_comments_sql,
+            "query": update_directions_sql,
             "useLegacySql": False,
         }
     },
     location=region,
     dag=dag)
 
-# create long comments table (one row per comment)
+# create directions_ingredients 
 
-individual_comments_sql = (f"""
-create or replace table {ai_stg_dataset_name}.individual_comments as 
-select recipe_id, comment1 as comment
-from {ai_stg_dataset_name}.recipe_comments
-union all
-select recipe_id, comment2 as comment
-from {ai_stg_dataset_name}.recipe_comments
-union all
-select recipe_id, comment3 as comment
-from {ai_stg_dataset_name}.recipe_comments
+directions_ingredients_sql = (f"""
+declare prompt_query STRING default "Identify all ingredients mentioned in the directions of the recipe. Return output as json with recipe_id, title, and mentioned_ingredients. ";
+create or replace table {ai_stg_dataset_name}.direction_ingredients as
+select *
+from ML.generate_text(
+  model remote_model_central.gemini_pro,
+  (
+    SELECT concat(prompt_query, to_json_string(json_object("recipe_id", recipe_id, "title", title, "recipe_directions", recipe_directions))) as prompt
+     FROM {ai_stg_dataset_name}.directions
+  ),
+  struct(TRUE as flatten_json_output)
+);
 """
 )
 
-create_individual_comments_csp = BigQueryInsertJobOperator(
-    task_id="create_individual_comments_csp",
+create_directions_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="create_directions_ingredients_csp",
     configuration={
         "query": {
-            "query": individual_comments_sql,
+            "query": directions_ingredients_sql,
             "useLegacySql": False,
         }
     },
     location=region,
     dag=dag)
 
-# Create the staging table for comments 
-
-create_comments_sql = (f"""
-create or replace table {stg_dataset_name}.Comments as
-SELECT ROW_NUMBER() OVER () AS comment_id, 
-      p.post_id, 
-      cast(FLOOR(RAND() * (select max(user_id) from magazine_recipes_stg.Users) + 1) as int64) AS user_id, 
-      c.comment,
-      'ai' as data_source, 
-      current_timestamp() as load_time
-from {ai_stg_dataset_name}.individual_comments c
-left join {stg_dataset_name}.Posts p on c.recipe_id = p.recipe_id
-where comment is not null""")
 
 
-create_comments_csp = BigQueryInsertJobOperator(
-    task_id="create_comments_csp",
+# change json format for direction_ingredients
+direction_ingredients_json_format_sql = (f"""
+create or replace table  {ai_stg_dataset_name}.direction_ingredients_json_format as
+select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\\\\n', ''), ']', ''), '[' , '')) as ml_generate_text_llm_result
+from {ai_stg_dataset_name}.direction_ingredients
+""")
+
+create_direction_ingredients_json_format_csp = BigQueryInsertJobOperator(
+    task_id="create_direction_ingredients_json_format_csp",
     configuration={
         "query": {
-            "query": create_comments_sql,
+            "query": direction_ingredients_json_format_sql,
             "useLegacySql": False,
         }
     },
     location=region,
     dag=dag)
 
-# add timestamp to comment
 
-add_comment_timestamp_sql = (f"""
-update {stg_dataset_name}.Comments c
-SET timestamp_commented = TIMESTAMP_ADD(
-    (SELECT p.timestamp_posted FROM {stg_dataset_name}.Posts p WHERE p.post_id = c.post_id),
-    INTERVAL CAST(FLOOR(RAND() * 6108032) AS INT64) SECOND
+# close the json for direction_ingredients_format_sql 
+direction_ingredients_closed_sql =(""" 
+UPDATE magazine_recipes_stg_af_ai.direction_ingredients_json_format 
+set ml_generate_text_llm_result = concat(ml_generate_text_llm_result, '"}')
+where ml_generate_text_llm_result not like '%"}%'
+""")
+
+create_direction_ingredients_closed_csp = BigQueryInsertJobOperator(
+    task_id="create_direction_ingredients_closed_csp",
+    configuration={
+        "query": {
+            "query": direction_ingredients_closed_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+
+# create direction_mentioned_ingredients 
+
+direction_mentioned_ingredients_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.direction_mentioned_ingredients AS
+select json_value(ml_generate_text_llm_result, '$.recipe_id') as recipe_id,
+  json_QUERY(ml_generate_text_llm_result, '$.mentioned_ingredients') as mentioned_ingredients,
+from {ai_stg_dataset_name}.direction_ingredients_json_format                                      
+"""
 )
-where 1 = 1;""")
 
-add_comment_timestamp_csp = BigQueryInsertJobOperator(
-    task_id="add_comment_timestamp_csp",
+create_direction_mentioned_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="create_direction_mentioned_ingredients_csp",
     configuration={
         "query": {
-            "query": add_timestamp_comments_sql,
+            "query": direction_mentioned_ingredients_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# create compare_ingredients
+
+compare_ingredients_sql = (f"""
+create or replace table {ai_stg_dataset_name}.compare_ingredients as
+select d.recipe_id, replace(d.database_ingredients, '\\\'', '') as db_ingredients, REPLACE(REPLACE(REPLACE(di.mentioned_ingredients, '"', ''), ']', ''), '[', '') AS ai_ingredients
+from {ai_stg_dataset_name}.directions as d
+INNER JOIN {ai_stg_dataset_name}.direction_mentioned_ingredients as di
+  ON d.recipe_id = di.recipe_id
+"""
+)
+
+create_compare_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="create_compare_ingredients_csp",
+    configuration={
+        "query": {
+            "query": compare_ingredients_sql,
             "useLegacySql": False,
         }
     },
@@ -216,81 +381,389 @@ add_comment_timestamp_csp = BigQueryInsertJobOperator(
     dag=dag)
 
 
-# fix dual comments
+#
 
-fix_dual_comments_sql = (f"""
-update {stg_dataset_name}.Comments
-set user_id =
-    CASE 
-    WHEN MOD((user_id + length(comment)), (select max(user_id) from {stg_dataset_name}.Users)) != 0 THEN MOD((user_id + length(comment)), (select max(user_id) from magazine_recipes_stg.Users))
-    ELSE MOD((user_id + length(comment)), (select max(user_id) from {stg_dataset_name}.Users)) + 1
-    END
-where post_id in (
-select c1.post_id from {stg_dataset_name}.Comments c1
-join {stg_dataset_name}.Comments c2 on c1.post_id = c2.post_id and c1.user_id = c2.user_id and c1.comment_id != c2.comment_id)
-""")
+# Create ingredients_difference
 
-fix_dual_comments_csp = BigQueryInsertJobOperator(
-    task_id="fix_dual_comments_csp",
-    configuration={
-        "query": {
-            "query": fix_dual_comments_sql,
-            "useLegacySql": False,
-        }
-    },
-    location=region,
-    dag=dag)
-
-# delete remaining duals
-
-remove_dual_comments_sql = (f"""
-delete from {stg_dataset_name}.Comments
-where comment_id in (
-select least(c.comment_id, c1.comment_id) 
-from {stg_dataset_name}.Comments c
-join {stg_dataset_name}.Comments c1 on c.user_id = c1.user_id and c.post_id = c1.post_id and c.comment_id != c1.comment_id)
-""")
-
-remove_dual_comments_csp = BigQueryInsertJobOperator(
-    task_id="remove_dual_comments_csp",
-    configuration={
-        "query": {
-            "query": remove_dual_comments_sql,
-            "useLegacySql": False,
-        }
-    },
-    location=region,
-    dag=dag)
-
-
-# change matching posters and commenters
-fix_self_comments_sql = (f"""
-update {stg_dataset_name}.Comments
-SET user_id = 
-    CASE 
-        WHEN user_id < (SELECT MAX(user_id) FROM {stg_dataset_name}.Users) THEN user_id + 1
-        ELSE user_id - 1
-    END
-WHERE post_id IN (
-    SELECT p.post_id 
-    FROM {stg_dataset_name}.Comments c
-    JOIN {stg_dataset_name}.Posts p ON c.user_id = p.user_id AND c.post_id = p.post_id
+ingredients_difference_sql = (f"""
+declare prompt_query STRING default " Identify and return a list of missing_ingredients which contains all elements of the ai_ingredients list that are not present in the db_ingredients list. Output a json document with only the following fields: recipe_id, db_ingredients, ai_ingredients and ingredients_difference.";
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.ingredients_difference AS
+select *
+from ML.generate_text(
+  model remote_model_central.gemini_pro,
+  (
+    select concat(prompt_query, to_json_string(json_object("recipe_id",recipe_id, "db_ingredients", db_ingredients, "ai_ingredients", ai_ingredients ))) as prompt
+    from  {ai_stg_dataset_name}.compare_ingredients
+  ),
+  struct(TRUE as flatten_json_output)
 );
 """)
 
-fix_self_comments_csp = BigQueryInsertJobOperator(
-    task_id="fix_self_comments_csp",
+create_ingredients_difference_csp = BigQueryInsertJobOperator(
+    task_id="create_ingredients_difference_csp",
     configuration={
         "query": {
-            "query": fix_self_comments_sql,
+            "query": ingredients_difference_sql,
             "useLegacySql": False,
         }
     },
     location=region,
     dag=dag)
 
-# add forgein and primary key constraints
+
+
+# change json format for ingredients_difference
+ingredients_difference_json_format_sql = (f"""
+create or replace table {ai_stg_dataset_name}.ingredients_difference_json_format as
+select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\\\\n', ''), ']', ''), '[' , '')) as ml_generate_text_llm_result
+from {ai_stg_dataset_name}.ingredients_difference
+""")
+
+create_ingredients_difference_json_format_csp = BigQueryInsertJobOperator(
+    task_id="create_ingredients_difference_json_format_csp",
+    configuration={
+        "query": {
+            "query": ingredients_difference_json_format_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# close the json for ingredients_difference_format_sql 
+
+# ingredients_difference_closed_sql =(""" 
+# UPDATE  magazine_recipes_stg_af_ai.ingredients_difference_json_format 
+# set ml_generate_text_llm_result = concat(ml_generate_text_llm_result, '"}')
+# where ml_generate_text_llm_result not like '%"}%'
+# """)
+
+# create_ingredients_difference_closed_csp = BigQueryInsertJobOperator(
+#     task_id="create_ingredients_difference_closed_csp",
+#     configuration={
+#         "query": {
+#             "query": ingredients_difference_closed_sql,
+#             "useLegacySql": False,
+#         }
+#     },
+#     location=region,
+#     dag=dag)
+
+
+# create missing_ingredients_list 
+
+missing_ingredients_list_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.missing_ingredients_list AS                           
+SELECT 
+    json_value(ml_generate_text_llm_result, '$.recipe_id') AS recipe_id,
+    ARRAY(
+        SELECT REPLACE(ingredient, '"', '') 
+        FROM UNNEST(SPLIT(json_QUERY(ml_generate_text_llm_result, '$.ingredients_difference'), ',')) AS ingredient
+    ) AS missing_ingredients
+FROM 
+    {ai_stg_dataset_name}.ingredients_difference_json_format
+"""
+)
+
+create_missing_ingredients_list_csp = BigQueryInsertJobOperator(
+    task_id="create_missing_ingredients_list_csp",
+    configuration={
+        "query": {
+            "query": missing_ingredients_list_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# create missing_ingredients_unnest 
+
+missing_ingredients_unnest_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.missing_ingredients_unnest AS
+SELECT
+  recipe_id,
+  ingredient
+FROM
+{ai_stg_dataset_name}.missing_ingredients_list
+CROSS JOIN
+  UNNEST(missing_ingredients) AS ingredient;
+"""
+)
+
+create_missing_ingredients_unnest_csp = BigQueryInsertJobOperator(
+    task_id="create_missing_ingredients_unnest_csp",
+    configuration={
+        "query": {
+            "query": missing_ingredients_unnest_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# missing_ingredients_with_ids
+
+missing_ingredients_with_ids_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.missing_ingredients_with_ids AS
+SELECT miu.*, i.ingredient_id FROM {ai_stg_dataset_name}.missing_ingredients_unnest AS miu
+LEFT JOIN (select ingredient_id, name, CONCAT(name, plural) as pluralname from {stg_dataset_name}.Ingredients) as i
+  ON miu.ingredient = i.name
+  or miu.ingredient = i.pluralname
+WHERE LENGTH(miu.ingredient) > 0
+"""
+)
+
+create_missing_ingredients_with_ids_csp = BigQueryInsertJobOperator(
+    task_id="create_missing_ingredients_with_ids_csp",
+    configuration={
+        "query": {
+            "query": missing_ingredients_with_ids_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# create similiar_ingredients
+
+similiar_ingredients_sql = (f"""
+create or replace table {ai_stg_dataset_name}.similar_ingredients as
+WITH row_number as (select mi.recipe_id, mi.ingredient, i.ingredient_id, i.name, ROW_NUMBER() OVER (PARTITION BY mi.ingredient ORDER BY i.name ASC) AS rn
+from {stg_dataset_name}.Ingredients i
+join {ai_stg_dataset_name}.missing_ingredients_with_ids mi
+ on i.name like CONCAT('%', mi.ingredient ,'%')
+where mi.ingredient_id is null)
+SELECT * FROM row_number
+WHERE rn = 1
+""" 
+)
+
+create_similiar_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="create_similar_ingredients_csp",
+    configuration={
+        "query": {
+            "query": similiar_ingredients_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# update missing_ingredients_with_ids
+
+update_missing_ingredients_sql = (f"""
+update {ai_stg_dataset_name}.missing_ingredients_with_ids miid
+set ingredient_id = (select ingredient_id from {ai_stg_dataset_name}.similar_ingredients si where si.recipe_id = miid.recipe_id and si.ingredient = miid.ingredient),
+ingredient = (select name from {ai_stg_dataset_name}.similar_ingredients si where si.recipe_id = miid.recipe_id and si.ingredient = miid.ingredient)
+where ingredient_id is null and ingredient IN (SELECT ingredient FROM {ai_stg_dataset_name}.similar_ingredients)
+"""
+)
+
+update_missing_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="update_missing_ingredients_csp",
+    configuration={
+        "query": {
+            "query": update_missing_ingredients_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# create new_ingredients_with_category 
+
+new_ingredients_with_category_sql = (f"""
+declare prompt_query STRING default " Identify the best category that matches the ingredient from the list. Return recipe_id, ingredient, and category in output as json";
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.new_ingredients_with_category AS
+select *
+from ML.generate_text(
+  model remote_model_central.gemini_pro,
+  (
+    select concat(prompt_query, to_json_string(json_object("recipe_id",recipe_id, "ingredients", ingredient, "categories", (select string_agg(distinct(category), ', ') from {stg_dataset_name}.Ingredients)))) as prompt
+    from {ai_stg_dataset_name}.missing_ingredients_with_ids
+    where ingredient_id is null and ingredient NOT IN ('no difference','[]')
+  ),
+  struct(TRUE as flatten_json_output)
+)
+"""
+)
+
+create_new_ingredients_with_category_csp = BigQueryInsertJobOperator(
+    task_id="create_new_ingredients_with_category",
+    configuration={
+        "query": {
+            "query": new_ingredients_with_category_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# change json format for new_ingredients_with_category
+# new_ingredients_with_category_json_format_sql = (f"""
+# create or replace table  {ai_stg_dataset_name}.new_ingredients_with_category_json_format as
+# select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\\\\n', ''), ']', ''), '[' , '')) as ml_generate_text_llm_result
+# from {ai_stg_dataset_name}.new_ingredients_with_category
+# """)
+
+# create_new_ingredients_with_category_json_format_csp = BigQueryInsertJobOperator(
+#     task_id="create_new_ingredients_with_category_json_format_csp",
+#     configuration={
+#         "query": {
+#             "query": new_ingredients_with_category_json_format_sql,
+#             "useLegacySql": False,
+#         }
+#     },
+#     location=region,
+#     dag=dag)
 
 
 
-start >> create_model_csp >> create_recipes_directions_csp >> create_directions_csp >> create_recipes_directions_for_nulls_csp >> create_directions_for_nulls_csp >> update_directions_csp >> create_directions_ingredients_csp >> create_direction_mentioned_ingredients_csp >> create_compare_ingredients_csp >> create_ingredients_difference_csp >> create_missing_ingredients_list_csp  >> create_missing_ingredients_unnest_csp >> create_missing_ingredients_with_ids_csp >> create_similiar_ingredients_csp  >> update_missing_ingredients_csp >> create_new_ingredients_with_category_csp >> create_new_ingredients_csp >> insert_into_ingredients_csp >> insert_into_quantities_csp >> update_recipes_csp >> end 
+
+# change json format for new_ingredients_with_category
+new_ingredients_with_category_json_format_sql = (f"""
+create or replace table  {ai_stg_dataset_name}.new_ingredients_with_category_json_format as
+select trim(replace(replace(replace(replace(replace(ml_generate_text_llm_result, '```json', ''), '```', ''), '\\\\n', ''), ']', ''), '[' , '')) as ml_generate_text_llm_result
+from {ai_stg_dataset_name}.new_ingredients_with_category
+""")
+
+create_new_ingredients_with_category_json_format_csp = BigQueryInsertJobOperator(
+    task_id="create_new_ingredients_with_category_json_format_csp",
+    configuration={
+        "query": {
+            "query": new_ingredients_with_category_json_format_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# close the json for new_ingredients_with_category_format_sql 
+new_ingredients_with_category_closed_sql =(""" 
+UPDATE  magazine_recipes_stg_af_ai.new_ingredients_with_category_json_format 
+set ml_generate_text_llm_result = concat(ml_generate_text_llm_result, '"}')
+where ml_generate_text_llm_result not like '%"}%'
+""")
+
+create_new_ingredients_with_category_closed_csp = BigQueryInsertJobOperator(
+    task_id="create_new_ingredients_with_category_closed_csp",
+    configuration={
+        "query": {
+            "query": new_ingredients_with_category_closed_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# create new_ingredients
+new_ingredients_sql = (f"""
+CREATE OR REPLACE TABLE {ai_stg_dataset_name}.new_ingredients AS
+select (select max(ingredient_id) from {stg_dataset_name}.Ingredients) + ROW_NUMBER() OVER() as ingredient_id,
+json_value(ml_generate_text_llm_result, '$.ingredients') as ingredient,
+  json_value(ml_generate_text_llm_result, '$.categories') as category
+from {ai_stg_dataset_name}.new_ingredients_with_category_json_format
+"""
+)
+
+create_new_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="create_new_ingredients_csp",
+    configuration={
+        "query": {
+            "query": new_ingredients_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# insert_ingredients 
+
+insert_into_ingredients_sql = (f"""
+INSERT INTO {stg_dataset_name}.Ingredients (ingredient_id, category, name, plural, data_source, load_time)
+SELECT
+  ingredient_id,
+  category,
+  ingredient,
+  NULL AS plural,
+  'ai' AS data_source,
+  current_timestamp() AS load_time
+FROM {ai_stg_dataset_name}.new_ingredients
+WHERE ingredient IS NOT NULL 
+"""
+)
+
+insert_into_ingredients_csp = BigQueryInsertJobOperator(
+    task_id="insert_into_ingredients_csp",
+    configuration={
+        "query": {
+            "query": insert_into_ingredients_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# insert_quantities 
+
+insert_into_quantities_sql = (f"""
+INSERT INTO {stg_dataset_name}.Quantity (quantity_id, recipe_id, ingredient_id, max_qty, min_qty, unit, preparation, optional, data_source, load_time)
+SELECT
+  (SELECT MAX(quantity_id) FROM {stg_dataset_name}.Quantity) + ROW_NUMBER() OVER() as quantity_id,
+  cast(recipe_id as int64) as recipe_id,
+  ingredient_id,
+  NULL AS max_qty,
+  NULL AS min_qty,
+  cast(NULL as string) AS unit,
+  cast(NULL as string) AS preparation,
+  cast(NULL as bool) AS optional,
+  'ai' AS data_source,
+  current_timestamp() AS load_time
+FROM {ai_stg_dataset_name}.missing_ingredients_with_ids
+WHERE ingredient_id IS NOT NULL
+"""
+)
+
+insert_into_quantities_csp = BigQueryInsertJobOperator(
+    task_id="insert_into_quantities_csp",
+    configuration={
+        "query": {
+            "query": insert_into_quantities_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+# update recipes 
+
+update_recipes_sql = (f"""
+UPDATE {stg_dataset_name}.Recipes as r
+SET directions = (SELECT recipe_directions FROM {ai_stg_dataset_name}.directions d WHERE CAST(d.recipe_id as INT64) = r.recipe_id)
+, data_source = CONCAT(data_source,'-ai')
+WHERE recipe_id IN (SELECT CAST(recipe_id AS INT64) FROM {ai_stg_dataset_name}.directions) AND directions IS NULL
+"""
+)
+
+update_recipes_csp = BigQueryInsertJobOperator(
+    task_id="update_recipes_csp",
+    configuration={
+        "query": {
+            "query": update_recipes_sql,
+            "useLegacySql": False,
+        }
+    },
+    location=region,
+    dag=dag)
+
+
+# do ease of prep stuff 
+
+
+
+start >> create_dataset_stg_af_ai >> wait >> create_recipes_directions_csp >> create_recipes_directions_json_format_csp >> create_recipes_directions_closed_csp >>create_directions_csp >> create_recipes_directions_for_nulls_csp >> create_recipes_directions_for_nulls_json_format_csp >> create_recipes_directions_for_nulls_closed_csp >> create_directions_for_nulls_csp >> update_directions_csp >> create_directions_ingredients_csp >> create_direction_ingredients_json_format_csp >> create_direction_ingredients_closed_csp >> create_direction_mentioned_ingredients_csp >> create_compare_ingredients_csp >> create_ingredients_difference_csp >> create_ingredients_difference_json_format_csp >> create_missing_ingredients_list_csp  >> create_missing_ingredients_unnest_csp >> create_missing_ingredients_with_ids_csp >> create_similiar_ingredients_csp  >> update_missing_ingredients_csp >> create_new_ingredients_with_category_csp >> create_new_ingredients_with_category_json_format_csp >> create_new_ingredients_with_category_closed_csp >> create_new_ingredients_csp >> insert_into_ingredients_csp >> insert_into_quantities_csp >> update_recipes_csp >> end 
