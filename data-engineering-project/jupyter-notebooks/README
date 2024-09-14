@@ -1,0 +1,7 @@
+Jupyter Notebooks: Data Engineering Prototyping
+
+Overview
+This directory contains the initial implementation of data integration logic. We developed and tested the logic for:
+- Decomposing and merging entities from different data sources.
+- Creating the social media site's schema (Users, Recipes, Posts, Comments).
+- Applying AI for data enrichment and creative generation of missing fields.
