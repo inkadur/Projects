@@ -5,7 +5,7 @@ This repository contains implementations of common data structures and algorithm
 
 ## Contents
 - Sorting Algorithms: Various iterative and divide & conquer sort implementations 
-- Linear Data Structures: ArrayList and LinkedList implmentation
+- Linear Data Structures: ArrayList, LinkedList, and Array-backed Queue implmentation
 - Trees: Implementation of BST, AVL Tree, and various BST traversal algorithms
 - Graphs: Bellman Ford Shortest Path Algorithm
 - Other Data Structures: Min Heaps, HashMaps
